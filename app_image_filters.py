@@ -35,7 +35,11 @@ def pil_to_cv(img: Image.Image) -> np.ndarray:
     return np.array(img)  # RGB
 
 def cv_to_pil(arr: np.ndarray) -> Image.Image:
-    """OpenCV RGB ndarray -> PIL RGB"""
+    """OpenCV RGB ndarray -> PIL RGB (safe for display)"""
+    if arr.ndim == 2:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+    elif arr.ndim == 3 and arr.shape[2] == 4:
+        arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
     arr = np.clip(arr, 0, 255).astype(np.uint8)
     return Image.fromarray(arr, mode="RGB")
 
@@ -67,7 +71,7 @@ def f_sepia(rgb: np.ndarray, strength: float = 1.0) -> np.ndarray:
     M = np.array([[0.393, 0.769, 0.189],
                   [0.349, 0.686, 0.168],
                   [0.272, 0.534, 0.131]])
-    out = rgb.dot(M.T)
+    out = rgb.astype(np.float32).dot(M.T)
     out = np.clip(out, 0, 255)
     if strength < 1.0:
         out = (strength * out + (1 - strength) * rgb)
@@ -87,6 +91,8 @@ def f_brightness_contrast(rgb: np.ndarray, brightness: int = 0, contrast: int = 
 
 def f_gaussian_blur(rgb: np.ndarray, radius: int = 3) -> np.ndarray:
     k = max(1, radius * 2 + 1)
+    if k % 2 == 0:
+        k += 1
     return cv2.GaussianBlur(rgb, (k, k), sigmaX=0)
 
 def f_motion_blur(rgb: np.ndarray, ksize: int = 9, angle_deg: int = 0) -> np.ndarray:
@@ -96,11 +102,15 @@ def f_motion_blur(rgb: np.ndarray, ksize: int = 9, angle_deg: int = 0) -> np.nda
     # rotate kernel
     M = cv2.getRotationMatrix2D((ksize / 2 - 0.5, ksize / 2 - 0.5), angle_deg, 1.0)
     kernel = cv2.warpAffine(kernel, M, (ksize, ksize))
-    kernel /= kernel.sum() if kernel.sum() != 0 else 1
+    s = kernel.sum()
+    kernel /= s if s != 0 else 1
     return cv2.filter2D(rgb, -1, kernel)
 
 def f_unsharp(rgb: np.ndarray, amount: float = 1.0, radius: int = 3) -> np.ndarray:
-    blur = cv2.GaussianBlur(rgb, (max(1, radius * 2 + 1), max(1, radius * 2 + 1)), 0)
+    k = max(1, radius * 2 + 1)
+    if k % 2 == 0:
+        k += 1
+    blur = cv2.GaussianBlur(rgb, (k, k), 0)
     out = cv2.addWeighted(rgb, 1 + amount, blur, -amount, 0)
     return out
 
@@ -131,8 +141,8 @@ def f_emboss(rgb: np.ndarray, strength: float = 1.0) -> np.ndarray:
 
 def f_oil_paint(rgb: np.ndarray, levels: int = 8, radius: int = 3) -> np.ndarray:
     # Try xphoto.oilPainting if available
-    if hasattr(cv2.xphoto, "oilPainting"):  # type: ignore[attr-defined]
-        return cv2.xphoto.oilPainting(rgb, size=radius, dynRatio=levels)
+    if hasattr(cv2, "xphoto") and hasattr(cv2.xphoto, "oilPainting"):  # type: ignore[attr-defined]
+        return cv2.xphoto.oilPainting(rgb, size=radius, dynRatio=levels)  # type: ignore[attr-defined]
     # Fallback: simple color quantization + median blur
     step = max(1, int(256 / max(2, levels)))
     quant = (rgb // step) * step + step // 2
@@ -152,7 +162,7 @@ def f_cartoon(rgb: np.ndarray) -> np.ndarray:
 
 def f_warm(rgb: np.ndarray, amount: float = 0.15) -> np.ndarray:
     out = rgb.astype(np.float32)
-    out[..., 0] *= (1 - amount)   # reduce blue a bit
+    out[..., 0] *= (1 - amount)   # reduce blue
     out[..., 2] *= (1 + amount)   # boost red
     return np.clip(out, 0, 255)
 
@@ -168,6 +178,59 @@ def f_vintage(rgb: np.ndarray, sepia_strength: float = 0.6) -> np.ndarray:
 
 def f_custom_kernel(rgb: np.ndarray, k: np.ndarray) -> np.ndarray:
     return cv2.filter2D(rgb, -1, k.astype(np.float32))
+
+# ---------------------------
+# Re-apply helper for batch
+# ---------------------------
+def apply_settings(arr: np.ndarray, settings: dict) -> np.ndarray:
+    """Apply the currently selected filter settings to an array."""
+    if not settings:
+        return arr
+    mode = settings.get("mode")
+    kind = settings.get("kind")
+
+    if mode == "Basic":
+        if kind == "Grayscale":
+            return f_grayscale(arr)
+        if kind == "Sepia":
+            return f_sepia(arr, settings["strength"])
+        if kind == "B&W Threshold":
+            return f_threshold(arr, settings["thresh"])
+        if kind == "Brightness/Contrast":
+            return f_brightness_contrast(arr, settings["brightness"], settings["contrast"])
+        if kind == "Gaussian Blur":
+            return f_gaussian_blur(arr, settings["radius"])
+        if kind == "Motion Blur":
+            return f_motion_blur(arr, settings["ksize"], settings["angle"])
+        if kind == "Sharpen":
+            return f_unsharp(arr, settings["amount"], settings["radius"])
+        if kind == "Edge (Canny)":
+            return f_canny(arr, settings["t1"], settings["t2"])
+
+    elif mode == "Advanced":
+        if kind == "HSV Adjust":
+            return f_hsv_adjust(arr, settings["hue_shift"], settings["sat_scale"], settings["val_scale"])
+        if kind == "Denoise (Bilateral)":
+            return f_bilateral_denoise(arr, settings["d"], settings["sigma_color"], settings["sigma_space"])
+        if kind == "Emboss":
+            return f_emboss(arr, settings["strength"])
+        if kind == "Oil Paint":
+            return f_oil_paint(arr, settings["levels"], settings["radius"])
+        if kind == "Cartoon":
+            return f_cartoon(arr)
+
+    elif mode == "Presets":
+        if kind == "Warm":
+            return f_warm(arr, settings["amount"])
+        if kind == "Cool":
+            return f_cool(arr, settings["amount"])
+        if kind == "Vintage":
+            return f_vintage(arr, settings["sepia_strength"])
+
+    elif mode == "Custom 3×3":
+        return f_custom_kernel(arr, np.array(settings["kernel"], dtype=np.float32))
+
+    return arr
 
 # ---------------------------
 # Sidebar: Upload & global opts
@@ -202,11 +265,14 @@ if not pil_images:
     st.stop()
 
 # Active image selector
-active_idx = 0 if len(pil_images) == 1 else st.selectbox("Choose image", list(range(len(pil_images))),
-                                                          format_func=lambda i: names[i], key="active_img")
+active_idx = 0 if len(pil_images) == 1 else st.selectbox(
+    "Choose image",
+    list(range(len(pil_images))),
+    format_func=lambda i: names[i],
+    key="active_img"
+)
 src_pil = pil_images[active_idx]
-src = pil_to_cv(src_pil)
-src = ensure_rgb(src)
+src = ensure_rgb(pil_to_cv(src_pil))
 
 # ---------------------------
 # Filter controls
@@ -215,74 +281,107 @@ st.subheader("Filter & Controls")
 
 col_controls, col_preview = st.columns([1, 2], vertical_alignment="top")
 
+settings = {}  # will store current choice for batch reuse
+
 with col_controls:
     mode = st.radio("Mode", ["Basic", "Advanced", "Presets", "Custom 3×3"],
                     help="Choose a filter group to reveal its controls.")
+    settings["mode"] = mode
 
     if mode == "Basic":
         basic = st.selectbox("Filter", [
             "Grayscale", "Sepia", "B&W Threshold",
             "Brightness/Contrast", "Gaussian Blur",
             "Motion Blur", "Sharpen", "Edge (Canny)"])
+        settings["kind"] = basic
+
         if basic == "Grayscale":
-            params = {}
             out = f_grayscale(src)
+
         elif basic == "Sepia":
             strength = st.slider("Strength", 0.0, 1.0, 0.9, 0.05)
+            settings.update(strength=strength)
             out = f_sepia(src, strength)
+
         elif basic == "B&W Threshold":
             thr = st.slider("Threshold", 0, 255, 128)
+            settings.update(thresh=thr)
             out = f_threshold(src, thr)
+
         elif basic == "Brightness/Contrast":
             b = st.slider("Brightness", -100, 100, 0)
             c = st.slider("Contrast", -100, 100, 0)
+            settings.update(brightness=b, contrast=c)
             out = f_brightness_contrast(src, b, c)
+
         elif basic == "Gaussian Blur":
             r = st.slider("Radius", 1, 25, 3)
+            settings.update(radius=r)
             out = f_gaussian_blur(src, r)
+
         elif basic == "Motion Blur":
             k = st.slider("Kernel size", 3, 51, 15, step=2)
             ang = st.slider("Angle (deg)", -90, 90, 0)
+            settings.update(ksize=k, angle=ang)
             out = f_motion_blur(src, k, ang)
+
         elif basic == "Sharpen":
             amt = st.slider("Amount", 0.0, 2.0, 0.8, 0.05)
             rad = st.slider("Radius", 1, 20, 3)
+            settings.update(amount=amt, radius=rad)
             out = f_unsharp(src, amt, rad)
+
         else:  # Edge (Canny)
             t1 = st.slider("Threshold 1", 0, 500, 100)
             t2 = st.slider("Threshold 2", 0, 500, 200)
+            settings.update(t1=t1, t2=t2)
             out = f_canny(src, t1, t2)
 
     elif mode == "Advanced":
         adv = st.selectbox("Filter", ["HSV Adjust", "Denoise (Bilateral)", "Emboss", "Oil Paint", "Cartoon"])
+        settings["kind"] = adv
+
         if adv == "HSV Adjust":
             hue = st.slider("Hue shift (°)", -90, 90, 0)
-            # OpenCV hue is [0,180] so shift must be halved in that space
-            out = f_hsv_adjust(src, hue_shift=hue // 2,
-                               sat_scale=st.slider("Saturation ×", 0.0, 3.0, 1.0, 0.05),
-                               val_scale=st.slider("Value ×", 0.0, 3.0, 1.0, 0.05))
+            sat = st.slider("Saturation ×", 0.0, 3.0, 1.0, 0.05)
+            val = st.slider("Value ×", 0.0, 3.0, 1.0, 0.05)
+            settings.update(hue_shift=hue // 2, sat_scale=sat, val_scale=val)
+            out = f_hsv_adjust(src, hue_shift=hue // 2, sat_scale=sat, val_scale=val)
+
         elif adv == "Denoise (Bilateral)":
-            out = f_bilateral_denoise(src,
-                                      d=st.slider("Diameter", 3, 21, 9, step=2),
-                                      sigma_color=st.slider("Sigma Color", 10, 250, 75),
-                                      sigma_space=st.slider("Sigma Space", 10, 250, 75))
+            d = st.slider("Diameter", 3, 21, 9, step=2)
+            sc = st.slider("Sigma Color", 10, 250, 75)
+            ss = st.slider("Sigma Space", 10, 250, 75)
+            settings.update(d=d, sigma_color=sc, sigma_space=ss)
+            out = f_bilateral_denoise(src, d=d, sigma_color=sc, sigma_space=ss)
+
         elif adv == "Emboss":
-            out = f_emboss(src, st.slider("Strength", 0.0, 2.0, 1.0, 0.05))
+            s = st.slider("Strength", 0.0, 2.0, 1.0, 0.05)
+            settings.update(strength=s)
+            out = f_emboss(src, s)
+
         elif adv == "Oil Paint":
-            out = f_oil_paint(src,
-                              levels=st.slider("Levels", 2, 32, 8),
-                              radius=st.slider("Radius", 1, 15, 3))
+            levels = st.slider("Levels", 2, 32, 8)
+            radius = st.slider("Radius", 1, 15, 3)
+            settings.update(levels=levels, radius=radius)
+            out = f_oil_paint(src, levels=levels, radius=radius)
+
         else:
             out = f_cartoon(src)
+            settings.update()  # no params
 
     elif mode == "Presets":
         preset = st.selectbox("Style", ["Warm", "Cool", "Vintage"])
         amt = st.slider("Intensity", 0.0, 1.0, 0.5, 0.05)
+        settings["kind"] = preset
         if preset == "Warm":
+            settings.update(amount=amt * 0.3)
             out = f_warm(src, amount=amt * 0.3)
         elif preset == "Cool":
+            settings.update(amount=amt * 0.3)
             out = f_cool(src, amount=amt * 0.3)
         else:
+            settings.update(sepia_strength=amt)
             out = f_vintage(src, sepia_strength=amt)
 
     else:  # Custom 3×3
@@ -299,20 +398,30 @@ with col_controls:
         if norm and abs(k.sum()) > 1e-6:
             k = k / k.sum()
         out = f_custom_kernel(src, k)
+        settings["kind"] = "Custom 3×3"
+        settings["kernel"] = k.tolist()
+
+# persist current settings for batch use
+st.session_state["last_settings"] = settings
 
 with col_preview:
     st.markdown("**Preview**")
     c1, c2 = st.columns(2)
-    c1.image(src, caption="Original", use_container_width=True)
-    c2.image(out, caption="Processed", use_container_width=True)
+    c1.image(cv_to_pil(src), caption="Original", use_container_width=True)
+    c2.image(cv_to_pil(out), caption="Processed", use_container_width=True)
 
     # Download single
     processed_pil = cv_to_pil(out)
     buf = io.BytesIO()
     processed_pil.save(buf, format="PNG")
     buf.seek(0)
-    st.download_button("⬇️ Download processed PNG", data=buf, file_name=f"{Path(names[active_idx]).stem}_filtered.png",
-                       mime="image/png", use_container_width=True)
+    st.download_button(
+        "⬇️ Download processed PNG",
+        data=buf,
+        file_name=f"{Path(names[active_idx]).stem}_filtered.png",
+        mime="image/png",
+        use_container_width=True
+    )
 
 st.divider()
 
@@ -323,34 +432,13 @@ st.subheader("Batch process all uploads (same settings)")
 st.caption("Applies the current filter settings to every uploaded image and returns a ZIP.")
 
 if st.button("Process all & download ZIP", type="primary"):
+    current = st.session_state.get("last_settings", {})
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for i, pimg in enumerate(pil_images):
-            arr = pil_to_cv(pimg)
-            arr = ensure_rgb(arr)
+            arr = ensure_rgb(pil_to_cv(pimg))
             try:
-                # Reuse the last computed 'out' by recomputing with same params:
-                # Re-run the same branch quickly:
-                if mode == "Basic":
-                    # Recreate same settings by reading widgets’ current values
-                    basic = st.session_state.get("Basic-Filter", None)  # not used; using live branch logic above
-                # Instead of duplicating logic, just re-evaluate minimal path:
-                # We reconstruct based on the selected mode/options:
-                if 'basic' in locals():
-                    pass  # not reliable; easier to re-apply per-mode using the same widget states
-                # For simplicity, call the same functions using the current UI states:
-                # (Because widgets keep state, we'll branch by 'mode' again.)
-                if mode == "Basic":
-                    # Pull current widget values via keys we know:
-                    # We'll recompute using similar conditions as above
-                    # Note: we can't read selectbox label directly; repeat minimal logic
-                    out_i = out  # acceptable for demo; see note below
-                elif mode == "Advanced":
-                    out_i = out
-                elif mode == "Presets":
-                    out_i = out
-                else:
-                    out_i = out
+                out_i = apply_settings(arr, current)
             except Exception:
                 out_i = arr
             pil_i = cv_to_pil(out_i)
