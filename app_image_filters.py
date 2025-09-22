@@ -8,9 +8,10 @@ from pathlib import Path
 import random
 
 import numpy as np
-from PIL import Image
 import cv2  # opencv-python-headless
 import streamlit as st
+from PIL import Image, ImageOps
+
 
 APP_TITLE = "📸 Image Filter Lab"
 
@@ -23,6 +24,11 @@ st.caption("Upload one or more images, choose a filter, and download results. Op
 # ---------------------------
 def load_pil(file) -> Image.Image:
     img = Image.open(file)
+    # Auto-apply EXIF orientation from cameras/phones
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGB")
     return img
@@ -186,8 +192,7 @@ def f_posterize(rgb: np.ndarray, levels: int = 6) -> np.ndarray:
 def f_color_splash(rgb: np.ndarray, hue_center: int = 0, hue_width: int = 10, sat_thresh: int = 30) -> np.ndarray:
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     h, s, v = cv2.split(hsv)
-    # circular difference in [0,180]
-    diff = np.abs((h.astype(int) - hue_center + 90) % 180 - 90)
+    diff = np.abs((h.astype(int) - hue_center + 90) % 180 - 90)  # circular distance
     mask = (diff <= hue_width) & (s >= sat_thresh)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     gray3 = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
@@ -206,20 +211,17 @@ def f_vignette(rgb: np.ndarray, strength: float = 0.5) -> np.ndarray:
 def f_glitch(rgb: np.ndarray, slices: int = 6, max_shift: int = 25, channel_shift: int = 10) -> np.ndarray:
     out = rgb.copy()
     h, w = out.shape[:2]
-    # random horizontal slices shifted
     ys = sorted(random.sample(range(1, h-1), k=min(slices-1, max(1, h//60)))) + [h-1]
     prev = 0
     for y in ys:
         shift = random.randint(-max_shift, max_shift)
         out[prev:y, :] = np.roll(out[prev:y, :], shift, axis=1)
         prev = y
-    # channel shifts
     for c in range(3):
         out[:, :, c] = np.roll(out[:, :, c], random.randint(-channel_shift, channel_shift), axis=1)
     return np.clip(out, 0, 255)
 
 def f_face_mosaic(rgb: np.ndarray, block: int = 15, scale_factor: float = 1.2, min_neighbors: int = 5) -> np.ndarray:
-    # Haar cascade (ships with OpenCV)
     cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     face_cascade = cv2.CascadeClassifier(cascade_path)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -231,28 +233,22 @@ def f_face_mosaic(rgb: np.ndarray, block: int = 15, scale_factor: float = 1.2, m
         out[y:y+h, x:x+w] = roi_pix
     return out
 
-def f_meme_caption(rgb: np.ndarray, top: str = "", bottom: str = "") -> np.ndarray:
-    out = rgb.copy()
-    h, w = out.shape[:2]
-    # Use OpenCV text with outline (white text + black border)
-    def draw(text, y):
-        if not text: return
-        text = text.upper()
-        font = cv2.FONT_HERSHEY_TRIPLEX
-        scale = max(0.8, min(2.5, w / 600))
-        thickness = max(2, int(3 * scale))
-        stroke = thickness + 3
-        (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
-        x = max(5, (w - tw) // 2)
-        # black stroke
-        cv2.putText(out, text, (x, y), font, scale, (0, 0, 0), stroke, lineType=cv2.LINE_AA)
-        # white fill
-        cv2.putText(out, text, (x, y), font, scale, (255, 255, 255), thickness, lineType=cv2.LINE_AA)
-    if top:
-        draw(top, int(40 + h * 0.08))
-    if bottom:
-        draw(bottom, int(h - 20))
-    return out
+def face_count(rgb: np.ndarray, scale_factor: float = 1.2, min_neighbors: int = 5) -> int:
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    face_cascade = cv2.CascadeClassifier(cascade_path)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=scale_factor, minNeighbors=min_neighbors)
+    if isinstance(faces, tuple):
+        return 0
+    return 0 if faces is None else len(faces)
+
+def dominant_hue(rgb: np.ndarray, sat_thresh: int = 30) -> int:
+    """Return 0..179 hue with highest histogram count (ignoring low-saturation pixels)."""
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    h, s, _ = cv2.split(hsv)
+    mask = (s >= sat_thresh).astype(np.uint8)
+    hist = cv2.calcHist([h], [0], mask, [180], [0, 180])
+    return int(hist.argmax())
 
 # ---------------------------
 # Re-apply helper for batch
@@ -310,6 +306,13 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Tip: Use batch mode at the bottom to process all uploads and download a ZIP.")
 
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("Orientation")
+    rot = st.selectbox("Rotate (°)", [0, 90, 180, 270], index=0)
+    flip_h = st.checkbox("Flip horizontally", value=False)
+    flip_v = st.checkbox("Flip vertically", value=False)
+
 # No images yet
 if not files:
     st.info("Upload one or more images to get started.")
@@ -337,7 +340,17 @@ active_idx = 0 if len(pil_images) == 1 else st.selectbox(
     format_func=lambda i: names[i],
     key="active_img"
 )
+
+# Apply manual orientation AFTER selection (and after EXIF auto-transpose from load)
 src_pil = pil_images[active_idx]
+if rot:
+    src_pil = src_pil.rotate(int(rot), expand=True)
+if flip_h:
+    src_pil = ImageOps.mirror(src_pil)
+if flip_v:
+    src_pil = ImageOps.flip(src_pil)
+
+# Convert once, after orientation
 src = ensure_rgb(pil_to_cv(src_pil))
 
 # ---------------------------
@@ -347,6 +360,7 @@ st.subheader("Filter & Controls")
 col_controls, col_preview = st.columns([1, 2], vertical_alignment="top")
 
 settings = {}  # current choice for batch reuse
+out = src.copy()
 
 with col_controls:
     mode = st.radio("Mode", ["Basic", "Advanced", "Presets", "Custom 3×3", "Fun"],
@@ -426,21 +440,23 @@ with col_controls:
         fun = st.selectbox("Effect", ["Pixelate", "Posterize", "Color Splash", "Vignette", "Glitch", "Face Mosaic", "Meme Caption"])
         settings["kind"] = fun
         if fun == "Pixelate":
-            block = st.slider("Block size", 4, 40, 12); settings.update(block=block); out = f_pixelate(src, block)
+            block = st.slider("Block size", 8, 60, 20); settings.update(block=block); out = f_pixelate(src, block)
         elif fun == "Posterize":
             levels = st.slider("Levels", 2, 16, 6); settings.update(levels=levels); out = f_posterize(src, levels)
         elif fun == "Color Splash":
-            hue = st.slider("Target hue (0–179)", 0, 179, 0)
-            width = st.slider("Hue width", 2, 30, 12)
-            sat = st.slider("Saturation threshold", 0, 255, 30)
+            guess = dominant_hue(src)
+            hue = st.slider("Target hue (0–179)", 0, 179, guess)
+            width = st.slider("Hue width", 4, 40, 18)
+            sat = st.slider("Saturation threshold", 0, 255, 25)
             settings.update(hue_center=hue, hue_width=width, sat_thresh=sat)
             out = f_color_splash(src, hue_center=hue, hue_width=width, sat_thresh=sat)
+            st.caption(f"Auto-picked hue ≈ **{guess}°** (you can adjust).")
         elif fun == "Vignette":
-            strength = st.slider("Strength", 0.0, 1.0, 0.5, 0.05); settings.update(strength=strength); out = f_vignette(src, strength)
+            strength = st.slider("Strength", 0.0, 1.0, 0.7, 0.05); settings.update(strength=strength); out = f_vignette(src, strength)
         elif fun == "Glitch":
-            slices = st.slider("Slices", 3, 20, 6)
-            max_shift = st.slider("Max shift (px)", 5, 80, 25)
-            chs = st.slider("Channel shift (px)", 0, 40, 10)
+            slices = st.slider("Slices", 3, 20, 8)
+            max_shift = st.slider("Max shift (px)", 5, 120, 40)
+            chs = st.slider("Channel shift (px)", 0, 60, 18)
             settings.update(slices=slices, max_shift=max_shift, channel_shift=chs)
             out = f_glitch(src, slices, max_shift, chs)
         elif fun == "Face Mosaic":
@@ -449,6 +465,8 @@ with col_controls:
             mn = st.slider("Min neighbors", 3, 10, 5)
             settings.update(block=block, scale_factor=float(sf), min_neighbors=int(mn))
             out = f_face_mosaic(src, block, float(sf), int(mn))
+            cnt = face_count(src, float(sf), int(mn))
+            st.caption(f"Detected **{cnt}** face(s).")
         else:  # Meme Caption
             top = st.text_input("Top text", value="")
             bottom = st.text_input("Bottom text", value="")
